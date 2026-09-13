@@ -11,7 +11,7 @@ Gestor de conexiones de escritorio remoto (RDP) para [Omarchy](https://omarchy.o
 ## Instalación
 
 ```bash
-git clone git@github.com:kuronosu/rdpm.git ~/Work/rdpm
+git clone https://github.com/kuronosu/rdpm.git ~/Work/rdpm
 cd ~/Work/rdpm
 ./install.sh
 ```
