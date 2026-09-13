@@ -1,0 +1,322 @@
+#!/usr/bin/env bash
+# Gestor de conexiones RDP (FreeRDP 3)
+#
+# Registro de máquinas: ~/.config/rdpm/machines.json
+# Contraseñas:          llavero del sistema (gnome-keyring, vía secret-tool)
+#
+# Uso:
+#   rdpm                    menú interactivo
+#   rdpm connect <name>     conectar a una máquina registrada
+#   rdpm last               conectar a la última máquina usada
+#   rdpm add | edit <name> | remove <name> | list
+
+set -uo pipefail
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/rdpm"
+DB="$CONFIG_DIR/machines.json"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/rdpm"
+LAST="$STATE_DIR/last"
+KEYRING_SERVICE="rdpm"
+
+mkdir -p "$CONFIG_DIR" "$STATE_DIR"
+[ -f "$DB" ] || echo '[]' > "$DB"
+
+# --- utilidades -------------------------------------------------------------
+
+die() { gum style --foreground 1 "✗ $*" >&2; exit 1; }
+info() { gum style --foreground 2 "$*"; }
+pause() { read -rsp "$(gum style --foreground 8 'Pulsa Enter para continuar…')"; echo; }
+
+expand_path() { case "$1" in "~") echo "$HOME" ;; "~/"*) echo "$HOME/${1#\~/}" ;; *) echo "$1" ;; esac; }
+
+machine_get() { jq -r --arg n "$1" --arg f "$2" '.[] | select(.name == $n) | .[$f] // ""' "$DB"; }
+machine_exists() { jq -e --arg n "$1" 'any(.[]; .name == $n)' "$DB" >/dev/null; }
+machine_names() { jq -r '.[].name' "$DB"; }
+
+db_write() { # db_write <filtro jq> [args jq...]
+  local filter="$1"; shift
+  local tmp; tmp="$(mktemp "$DB.XXXX")"
+  jq "$@" "$filter" "$DB" > "$tmp" && mv "$tmp" "$DB"
+}
+
+secret_get() { secret-tool lookup service "$KEYRING_SERVICE" machine "$1" 2>/dev/null; }
+secret_set() { printf '%s' "$2" | secret-tool store --label="RDP: $1" service "$KEYRING_SERVICE" machine "$1"; }
+secret_del() { secret-tool clear service "$KEYRING_SERVICE" machine "$1" 2>/dev/null || true; }
+
+# --- alta / edición / baja --------------------------------------------------
+
+machine_form() { # machine_form [nombre existente]
+  local old="${1:-}" name host port user domain share password
+
+  name="$(gum input --header "Nombre (alias)" --placeholder "oficina" --value "$old")" || return 1
+  [ -n "$name" ] || die "El nombre no puede estar vacío"
+  [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || die "Usa solo letras, números, punto, guion o guion bajo"
+  if [ "$name" != "$old" ] && machine_exists "$name"; then die "Ya existe una máquina llamada '$name'"; fi
+
+  host="$(gum input --header "Host o IP" --placeholder "192.168.1.10" --value "$(machine_get "$old" host)")" || return 1
+  [ -n "$host" ] || die "El host no puede estar vacío"
+  port="$(gum input --header "Puerto" --value "$(machine_get "$old" port | grep . || echo 3389)")" || return 1
+  [[ "$port" =~ ^[0-9]+$ ]] || die "Puerto inválido"
+  domain="$(gum input --header "Dominio (vacío si no hay)" --placeholder "EMPRESA" --value "$(machine_get "$old" domain)")" || return 1
+  user="$(gum input --header "Usuario" --value "$(machine_get "$old" user)")" || return 1
+  share="$(gum input --header "Carpeta de Linux a compartir con Windows (vacío = no compartir)" \
+    --placeholder "~/RDP" --value "$(machine_get "$old" share)")" || return 1
+  share="${share%/}"
+  [[ "$share" != *,* ]] || die "La ruta de la carpeta no puede contener comas"
+  if [ -n "$share" ] && [ "$(expand_path "$share")" = "$HOME" ]; then
+    gum confirm "Compartir el home entero expone claves SSH, tokens y demás configuración a Windows. ¿Seguro?" \
+      --affirmative "Sí, compartir" --negative "Cambiar" --default=false || return 1
+  fi
+
+  local pw_header="Contraseña (vacío = preguntar al conectar)"
+  [ -n "$old" ] && [ -n "$(secret_get "$old")" ] && pw_header="Contraseña (vacío = mantener la actual)"
+  password="$(gum input --password --header "$pw_header")" || return 1
+
+  local entry
+  entry="$(jq -n --arg name "$name" --arg host "$host" --argjson port "$port" \
+    --arg user "$user" --arg domain "$domain" --arg share "$share" \
+    '{name: $name, host: $host, port: $port, user: $user, domain: $domain, share: $share}')"
+
+  if [ -n "$old" ]; then
+    db_write 'map(if .name == $old then $e else . end)' --arg old "$old" --argjson e "$entry"
+    if [ "$name" != "$old" ]; then
+      local prev; prev="$(secret_get "$old")"
+      secret_del "$old"
+      [ -n "$prev" ] && [ -z "$password" ] && secret_set "$name" "$prev"
+      [ "$(cat "$LAST" 2>/dev/null)" = "$old" ] && echo "$name" > "$LAST"
+    fi
+  else
+    db_write '. + [$e]' --argjson e "$entry"
+  fi
+
+  [ -n "$password" ] && secret_set "$name" "$password"
+  info "✓ Máquina '$name' guardada"
+}
+
+machine_remove() {
+  local name="$1"
+  machine_exists "$name" || die "No existe la máquina '$name'"
+  gum confirm "¿Eliminar '$name' y su contraseña guardada?" --affirmative "Eliminar" --negative "Cancelar" || return 0
+  db_write 'map(select(.name != $n))' --arg n "$name"
+  secret_del "$name"
+  info "✓ Máquina '$name' eliminada"
+}
+
+# --- conexión ---------------------------------------------------------------
+
+connect() {
+  local name="$1"
+  machine_exists "$name" || die "No existe la máquina '$name'"
+
+  local existing
+  existing="$(sessions_list | awk -F'\t' -v n="$name" '$3 == n { print $1; exit }')"
+  if [ -n "$existing" ]; then
+    session_focus "$existing"
+    return 0
+  fi
+
+  local host port user domain share password saved=1
+  host="$(machine_get "$name" host)"
+  port="$(machine_get "$name" port)"
+  user="$(machine_get "$name" user)"
+  domain="$(machine_get "$name" domain)"
+  share="$(machine_get "$name" share)"
+  password="$(secret_get "$name")"
+
+  if [ -z "$user" ]; then
+    user="$(gum input --header "Usuario para $name")" || return 1
+    db_write 'map(if .name == $n then .user = $u else . end)' --arg n "$name" --arg u "$user"
+  fi
+  if [ -z "$password" ]; then
+    saved=0
+    password="$(gum input --password --header "Contraseña de ${domain:+$domain\\}$user@$host")" || return 1
+  fi
+
+  echo "$name" > "$LAST"
+  local log="$STATE_DIR/$name.log"
+  gum style --foreground 4 "󰢹 Conectando a $name (${domain:+$domain\\}$user@$host:$port)…"
+
+  # Los argumentos (incluida la contraseña) van por stdin, no aparecen en `ps`
+  local args=(
+    "/v:$host:$port"
+    "/u:$user"
+    "/p:$password"
+    "/cert:tofu"
+    "/auth-pkg-list:none,ntlm"
+    "/title:$name"
+    "/dynamic-resolution"
+    "/size:1920x1080"
+    "/gfx:AVC444"
+    "/network:auto"
+    "/sound:sys:pulse"
+    "/microphone:sys:pulse"
+    "+clipboard"
+    "+auto-reconnect"
+  )
+  [ -n "$domain" ] && args+=("/d:$domain")
+  if [ -n "$share" ]; then
+    # En Windows aparece como "<carpeta> en <este equipo>", también en \\tsclient\<carpeta>
+    local share_path; share_path="$(expand_path "$share")"
+    mkdir -p "$share_path"
+    args+=("/drive:$(basename "$share_path"),$share_path")
+  fi
+
+  # setsid: la sesión sobrevive al cierre de la terminal
+  printf '%s\n' "${args[@]}" | setsid xfreerdp3 /args-from:stdin > "$log" 2>&1 &
+  local pid=$!
+  unset args
+
+  # Esperar a que aparezca la ventana o a que el proceso falle
+  local i
+  for ((i = 0; i < 60; i++)); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      wait "$pid"; local rc=$?
+      gum style --foreground 1 "✗ La conexión falló (código $rc):"
+      grep -E 'ERRCONNECT|ERRINFO|LOGON|failed|error' "$log" | grep -v Kerberos | tail -5 | sed 's/^\[[^]]*\] \[[^]]*\] //'
+      if grep -q LOGON_FAILURE "$log" && [ "$saved" -eq 1 ]; then
+        gum style --foreground 3 "La contraseña guardada parece incorrecta. Edita la máquina para cambiarla."
+      fi
+      pause
+      return 1
+    fi
+    if hyprctl clients -j 2>/dev/null | jq -e --argjson p "$pid" --arg t "$name" 'any(.[]; .pid == $p or (.title | startswith($t)))' >/dev/null; then
+      break
+    fi
+    sleep 0.5
+  done
+
+  if [ "$saved" -eq 0 ] && gum confirm "Conectado. ¿Guardar la contraseña en el llavero?" --affirmative "Guardar" --negative "No"; then
+    secret_set "$name" "$password" && info "✓ Contraseña guardada"
+  fi
+  unset password
+}
+
+# --- sesiones activas -------------------------------------------------------
+
+# Una línea por ventana de FreeRDP: address \t pid \t título \t workspace
+sessions_list() {
+  hyprctl clients -j 2>/dev/null |
+    jq -r '.[] | select(.class | test("freerdp"; "i")) | [.address, .pid, .title, .workspace.name] | @tsv'
+}
+
+session_focus() {
+  hyprctl dispatch "hl.dsp.focus({ window = \"address:$1\" })" >/dev/null
+}
+
+session_disconnect() { # session_disconnect <pid> <título>
+  # SIGTERM hace que FreeRDP se desconecte limpiamente; la sesión sigue viva en Windows
+  kill -TERM "$1" 2>/dev/null
+  local i
+  for ((i = 0; i < 20; i++)); do kill -0 "$1" 2>/dev/null || break; sleep 0.25; done
+  kill -0 "$1" 2>/dev/null && kill -KILL "$1" 2>/dev/null
+  info "✓ '$2' desconectada"
+}
+
+sessions_menu() {
+  while true; do
+    clear
+    gum style --bold --foreground 4 --border rounded --padding "0 2" "󰍹  Sesiones activas"
+
+    local options=() address pid title ws
+    while IFS=$'\t' read -r address pid title ws; do
+      options+=("󰢹  $title  —  workspace $ws"$'\t'"$address|$pid|$title")
+    done < <(sessions_list)
+
+    if [ ${#options[@]} -eq 0 ]; then
+      gum style --foreground 8 "No hay sesiones abiertas."
+      sleep 1.5
+      return 0
+    fi
+    [ ${#options[@]} -gt 1 ] && options+=("󰅖  Desconectar todas"$'\t'"all")
+    options+=("  Volver"$'\t'"back")
+
+    local choice
+    choice="$(gum choose --header "Elige una sesión" --label-delimiter=$'\t' --height 15 "${options[@]}")" || return 0
+
+    case "$choice" in
+      back) return 0 ;;
+      all)
+        gum confirm "¿Desconectar todas las sesiones?" --affirmative "Desconectar" --negative "Cancelar" || continue
+        while IFS=$'\t' read -r address pid title ws; do session_disconnect "$pid" "$title"; done < <(sessions_list)
+        sleep 1
+        ;;
+      *)
+        IFS='|' read -r address pid title <<< "$choice"
+        local action
+        action="$(gum choose --header "$title" --label-delimiter=$'\t' \
+          "  Ir a la ventana"$'\t'"focus" \
+          "󰅖  Desconectar (la sesión sigue abierta en Windows)"$'\t'"disconnect" \
+          "  Volver"$'\t'"back")" || continue
+        case "$action" in
+          focus) session_focus "$address"; exit 0 ;;
+          disconnect) session_disconnect "$pid" "$title"; sleep 1 ;;
+        esac
+        ;;
+    esac
+  done
+}
+
+# Salida JSON para el módulo de la barra
+bar_status() {
+  local list count help="Clic: máquinas · Clic derecho: última · Clic central: sesiones"
+  list="$(sessions_list)"
+  count="$(grep -c . <<< "$list")"
+  if [ "$count" -gt 0 ]; then
+    jq -cn --arg t "󰢹 $count" --arg s "$(cut -f3 <<< "$list" | paste -sd ',' | sed 's/,/, /g')" --arg h "$help" \
+      '{text: $t, tooltip: "Sesiones activas: \($s)\n\($h)", class: "active"}'
+  else
+    jq -cn --arg h "$help" '{text: "󰢹", tooltip: "Escritorio remoto\n\($h)", class: ""}'
+  fi
+}
+
+# --- menú -------------------------------------------------------------------
+
+menu() {
+  while true; do
+    clear
+    gum style --bold --foreground 4 --border rounded --padding "0 2" "󰢹  Escritorio remoto"
+
+    local options=() line active
+    active="$(sessions_list | grep -c .)"
+    [ "$active" -gt 0 ] && options+=("󰍹  Sesiones activas ($active)"$'\t'"sessions")
+    while IFS=$'\t' read -r name label; do
+      options+=("$label"$'\t'"connect:$name")
+    done < <(jq -r '.[] | [.name, "󰢹  \(.name)  —  \(if .domain != "" then .domain + "\\" else "" end)\(.user)@\(.host)"] | @tsv' "$DB")
+    options+=(" Añadir máquina"$'\t'"add")
+    [ "$(jq length "$DB")" -gt 0 ] && options+=(" Editar máquina"$'\t'"edit" " Eliminar máquina"$'\t'"remove")
+    options+=("  Salir"$'\t'"quit")
+
+    local choice
+    choice="$(gum choose --header "Elige una máquina" --label-delimiter=$'\t' --height 15 "${options[@]}")" || exit 0
+
+    case "$choice" in
+      connect:*) connect "${choice#connect:}" && exit 0 ;;
+      sessions) sessions_menu ;;
+      add) machine_form || pause ;;
+      edit|remove)
+        local target
+        target="$(gum choose --header "¿Qué máquina?" $(machine_names))" || continue
+        if [ "$choice" = edit ]; then machine_form "$target" || pause; else machine_remove "$target"; fi
+        ;;
+      quit) exit 0 ;;
+    esac
+  done
+}
+
+# --- entrada ----------------------------------------------------------------
+
+case "${1:-}" in
+  "") menu ;;
+  connect) connect "${2:?Falta el nombre}" ;;
+  last)
+    last="$(cat "$LAST" 2>/dev/null)"
+    [ -n "$last" ] && machine_exists "$last" && connect "$last" || menu
+    ;;
+  sessions) sessions_menu ;;
+  status) bar_status ;;
+  add) machine_form ;;
+  edit) machine_form "${2:?Falta el nombre}" ;;
+  remove) machine_remove "${2:?Falta el nombre}" ;;
+  list) jq -r '.[] | "\(.name)\t\(.domain)\\\(.user)@\(.host):\(.port)\t\(if (.share // "") != "" then "comparte " + .share else "sin carpeta compartida" end)"' "$DB" | column -t -s $'\t' ;;
+  *) echo "Uso: rdpm [connect <nombre> | last | sessions | status | add | edit <nombre> | remove <nombre> | list]" >&2; exit 1 ;;
+esac

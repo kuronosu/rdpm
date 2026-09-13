@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Lanzador para el icono de la barra: abre rdpm en una terminal flotante
+# Uso: rdpm-launch [subcomando de rdpm]
+exec uwsm-app -- xdg-terminal-exec --app-id=org.omarchy.terminal --title=rdpm \
+  -e "$HOME/.local/bin/rdpm" "$@"
