@@ -31,9 +31,21 @@ bar_module() {
 
 shell_json_edit() { # shell_json_edit <filtro jq> [args jq...]
   local filter="$1"; shift
-  cp "$SHELL_JSON" "$SHELL_JSON.bak.$(date +%s)"
-  local tmp; tmp="$(mktemp "$SHELL_JSON.XXXX")"
-  jq --indent 2 "$@" "$filter" "$SHELL_JSON" > "$tmp" && mv "$tmp" "$SHELL_JSON"
+  # Sigue el enlace si shell.json es un symlink (dotfiles) y conserva sus permisos
+  local target; target="$(readlink -f -- "$SHELL_JSON")"
+  local tmp; tmp="$(mktemp "$target.XXXX")"
+  if ! jq --indent 2 "$@" "$filter" "$target" > "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  # Sin cambios: ni copia de seguridad ni reescritura
+  if cmp -s "$tmp" "$target"; then
+    rm -f "$tmp"
+    return 0
+  fi
+  cp "$target" "$target.bak.$(date +%s)"
+  chmod --reference="$target" "$tmp"
+  mv "$tmp" "$target"
 }
 
 uninstall() {
@@ -63,7 +75,8 @@ check_deps() {
     fi
   fi
   command -v hyprctl >/dev/null || warn "No se encontró Hyprland: la gestión de sesiones no funcionará."
-  if ! busctl --user list 2>/dev/null | grep -q org.freedesktop.secrets; then
+  # Sin -q: grep lee toda la salida y busctl no muere por SIGPIPE (pipefail daría un falso aviso)
+  if ! busctl --user list 2>/dev/null | grep org.freedesktop.secrets >/dev/null; then
     warn "No hay un servicio de llavero activo (gnome-keyring): no se podrán guardar contraseñas."
   fi
 }
