@@ -23,6 +23,27 @@ mkdir -p "$CONFIG_DIR" "$STATE_DIR"
 
 # --- utilidades -------------------------------------------------------------
 
+# Omarchy exporta los colores de gum (GUM_*, FOREGROUND, BACKGROUND…) solo al iniciar
+# sesión, así que tras cambiar de tema el entorno trae los del tema anterior. Se leen
+# del tema actual en cada llamada, y los fondos iguales al del tema se quitan para usar
+# el de la terminal, que Omarchy actualiza en caliente al cambiar de tema.
+OMARCHY_GUM_ENV="$HOME/.local/state/omarchy/current/theme/gum_env.lua"
+
+gum() {
+  [ -f "$OMARCHY_GUM_ENV" ] || { command gum "$@"; return; }
+  (
+    unset FOREGROUND BACKGROUND BORDER_FOREGROUND BORDER_BACKGROUND $(compgen -e GUM_)
+    while IFS=$'\t' read -r var value; do
+      export "$var=$value"
+    done < <(sed -nE 's/^hl\.env\("([A-Z_]+)", *"([^"]*)"\).*/\1\t\2/p' "$OMARCHY_GUM_ENV")
+    bg="${BACKGROUND:-}"
+    for var in $(compgen -e | grep -E '(^|_)BACKGROUND$'); do
+      [ "${!var}" = "$bg" ] && unset "$var"
+    done
+    exec gum "$@"
+  )
+}
+
 die() { gum style --foreground 1 "✗ $*" >&2; exit 1; }
 info() { gum style --foreground 2 "$*"; }
 pause() { read -rsp "$(gum style --foreground 8 'Pulsa Enter para continuar…')"; echo; }
