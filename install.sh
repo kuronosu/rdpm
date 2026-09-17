@@ -48,11 +48,15 @@ shell_json_edit() { # shell_json_edit <filtro jq> [args jq...]
   mv "$tmp" "$target"
 }
 
+module_installed() {
+  [ -f "$SHELL_JSON" ] && jq -e --arg id "$MODULE_ID" 'any(.. | objects; .id == $id)' "$SHELL_JSON" >/dev/null
+}
+
 uninstall() {
   for s in "${SCRIPTS[@]}"; do
     if [ -L "$BIN_DIR/$s" ]; then rm "$BIN_DIR/$s" && say "Eliminado $BIN_DIR/$s"; fi
   done
-  if [ -f "$SHELL_JSON" ] && jq -e --arg id "$MODULE_ID" '[.. | objects | select(.id? == $id)] | length > 0' "$SHELL_JSON" >/dev/null; then
+  if module_installed; then
     shell_json_edit '.bar.layout |= with_entries(.value |= map(select(.id != $id)))' --arg id "$MODULE_ID"
     say "Icono quitado de la barra"
   fi
@@ -60,7 +64,7 @@ uninstall() {
 }
 
 check_deps() {
-  local missing=() cmd pkg
+  local missing=() cmd
   declare -A deps=([xfreerdp3]=freerdp [gum]=gum [jq]=jq [secret-tool]=libsecret)
   for cmd in "${!deps[@]}"; do
     command -v "$cmd" >/dev/null || missing+=("${deps[$cmd]}")
@@ -104,7 +108,7 @@ install() {
 
   if [ -f "$SHELL_JSON" ]; then
     local module; module="$(bar_module)"
-    if jq -e --arg id "$MODULE_ID" '[.. | objects | select(.id? == $id)] | length > 0' "$SHELL_JSON" >/dev/null; then
+    if module_installed; then
       # Actualiza la definición conservando la posición en la barra
       shell_json_edit '.bar.layout |= with_entries(.value |= map(if .id == $m.id then $m else . end))' --argjson m "$module"
       say "Icono de la barra actualizado"
