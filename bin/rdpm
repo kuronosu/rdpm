@@ -149,6 +149,18 @@ machine_remove() {
 
 # --- conexión ---------------------------------------------------------------
 
+# cert_changed <host> <puerto> <log>: FreeRDP pregunta por stdin (Y/T/N) cuando el certificado
+# cambia, pero ahí van los argumentos, así que no se puede responder. Se pregunta aquí y, si se
+# acepta, se borra el certificado guardado para que TOFU guarde el nuevo al reconectar.
+cert_changed() {
+  local pem="${XDG_CONFIG_HOME:-$HOME/.config}/freerdp/server/${1,,}_$2.pem"
+  warn "El certificado de $1 cambió. Windows lo renueva solo al acercarse el vencimiento;" \
+    "si no lo esperabas, confirma la huella con el administrador."
+  sed -n '/^New Certificate details/,/^The above X.509/{/^The above/!p}' "$3"
+  gum confirm "¿Confiar en el certificado nuevo?" --affirmative "Confiar" --negative "Cancelar" --default=false || return 1
+  rm -f -- "$pem"
+}
+
 connect() {
   local name="$1" host port user domain share password saved=1
   machine_load "$name" || die "No existe la máquina '$name'"
@@ -207,6 +219,11 @@ connect() {
   # Esperar a que aparezca la ventana o a que el proceso falle
   local i
   for ((i = 0; i < 60; i++)); do
+    if grep -q 'has changed!!!' "$log"; then
+      kill -TERM "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+      cert_changed "$host" "$port" "$log" && { connect "$name"; return; }
+      return 1
+    fi
     if ! kill -0 "$pid" 2>/dev/null; then
       wait "$pid"; local rc=$?
       err "La conexión falló (código $rc):"
